@@ -2,73 +2,89 @@ import json
 from scapy.all import rdpcap
 from datetime import datetime
 from decimal import Decimal
-import time
+import bisect
 
 # --- CONFIGURAZIONE ---
 JSON_FILE = "output.json"
 PCAP_FILE = "unici.pcap"
 OUTPUT_JSON = "mapped.json"
-MAX_DELTA = 0.001  # massimo delta in secondi accettabile
+MAX_DELTA = 0.05  # 50 ms realistici
 
 # --- CARICO I DATI ---
 with open(JSON_FILE, 'r') as f:
-    gps_data = json.load(f)  # lista di gruppi JSON
+    gps_data = json.load(f)
 
 packets = rdpcap(PCAP_FILE)
-packet_timestamps = [(pkt.time, pkt) for pkt in packets]
 
-# --- FUNZIONE PER CONVERTIRE frame.time IN TIMESTAMP ---
+# NORMALIZZO SUBITO I TIMESTAMP DEI PACCHETTI (FLOAT UTC)
+packet_timestamps = [(float(pkt.time), pkt) for pkt in packets]
+packet_timestamps.sort(key=lambda x: x[0])
+packet_times = [x[0] for x in packet_timestamps]
+
+# --- PARSE frame.time (CET → UTC) ---
 def parse_frame_time(frame_time_str):
     # esempio: "Dec  5, 2025 12:39:54.284435000 CET"
-    frame_time_str = frame_time_str.rstrip(" CET")  # rimuove CET
-    # separo secondi e nanosecondi
+    frame_time_str = frame_time_str.replace(" CET", "")
     date_part, frac = frame_time_str.split(".")
-    micro = frac[:6]  # prendo solo i primi 6 numeri per microsecondi
+    micro = frac[:6]
     new_str = f"{date_part}.{micro}"
     dt = datetime.strptime(new_str, "%b %d, %Y %H:%M:%S.%f")
+    #return dt.timestamp() - 3600  # CET → UTC
     return dt.timestamp()
 
-# --- ORDINO PER TIMESTAMP NUMERICO ---
-gps_data.sort(key=lambda x: parse_frame_time(x["_source"]["layers"]["frame"]["frame.time"]))
-packet_timestamps.sort(key=lambda x: x[0])
+# --- ORDINO GPS ---
+gps_data.sort(
+    key=lambda x: parse_frame_time(
+        x["_source"]["layers"]["frame"]["frame.time"]
+    )
+)
 
-# --- FUNZIONE PER ESTRARRE COORDINATE ---
+# --- ESTRAZIONE COORDINATE ---
 def extract_coords(entry):
     try:
         layers = entry["_source"]["layers"]
-        its_cam = layers["its"]["cam.CamPayload_element"]
-        ref_pos = its_cam["cam.camParameters_element"]["cam.basicContainer_element"]["its.referencePosition_element"]
-        lat = int(ref_pos["its.latitude"])
-        lon = int(ref_pos["its.longitude"])
-        return lat, lon
+        ref_pos = (
+            layers["its"]["cam.CamPayload_element"]
+            ["cam.camParameters_element"]
+            ["cam.basicContainer_element"]
+            ["its.referencePosition_element"]
+        )
+        return int(ref_pos["its.latitude"]), int(ref_pos["its.longitude"])
     except KeyError:
         return None, None
 
+# --- JSON SAFE ---
 def make_json_safe(obj):
     if isinstance(obj, (int, float, str, bool)) or obj is None:
         return obj
-    if isinstance(obj, (Decimal,)):
-        return float(obj)  # o: return str(obj)
+    if isinstance(obj, Decimal):
+        return float(obj)
     if isinstance(obj, dict):
         return {k: make_json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [make_json_safe(x) for x in obj]
-    return str(obj)  # fallback
+    return str(obj)
 
-# --- TROVA PACCHETTO PIÙ VICINO ---
+# --- TROVA PACCHETTO PIÙ VICINO (BINARY SEARCH) ---
 def find_closest_packet(ts):
-    closest_pkt = None
-    closest_delta = float('inf')
-    for pkt_ts, pkt in packet_timestamps:
+    idx = bisect.bisect_left(packet_times, ts)
+
+    candidates = []
+    if idx > 0:
+        candidates.append(packet_timestamps[idx - 1])
+    if idx < len(packet_timestamps):
+        candidates.append(packet_timestamps[idx])
+
+    best_pkt = None
+    best_delta = float("inf")
+
+    for pkt_ts, pkt in candidates:
         delta = abs(pkt_ts - ts)
-        #print(delta)
-        #print(pkt_ts, ts)
-        if delta < closest_delta:
-            closest_delta = delta
-            closest_pkt = pkt
-        elif pkt_ts > ts and delta > closest_delta:
-            break
-    return closest_pkt, closest_delta
+        if delta < best_delta:
+            best_delta = delta
+            best_pkt = pkt
+
+    return best_pkt, best_delta
 
 # --- MAPPING ---
 mapped = []
@@ -76,31 +92,30 @@ used_packets = set()
 
 for entry in gps_data:
     ts = parse_frame_time(entry["_source"]["layers"]["frame"]["frame.time"])
-    #ip_src = entry["_source"]["layers"]["ip"]["ip.src"]
     lat, lon = extract_coords(entry)
-    #print(lat, lon)
+
     if lat is None:
-        continue  # salta entry senza coordinate
+        continue
 
     pkt, delta = find_closest_packet(ts)
+    print(delta)
+
     if pkt and delta <= MAX_DELTA and id(pkt) not in used_packets:
         mapped.append({
             "timestamp_gps": ts,
             "latitude": lat,
             "longitude": lon,
             "packet": {
-                "timestamp": pkt.time,
-                #"summary": pkt.summary()
-                "ip": pkt["IP"].src
+                "timestamp": float(pkt.time),
+                "ip": pkt["IP"].src if "IP" in pkt else None
             }
         })
-        print(id(pkt))
         used_packets.add(id(pkt))
 
 safe_mapped = make_json_safe(mapped)
 
-# --- SALVO IL JSON ---
-with open(OUTPUT_JSON, 'w') as f:
+# --- SALVO JSON ---
+with open(OUTPUT_JSON, "w") as f:
     json.dump(safe_mapped, f, indent=2)
 
 print(f"Mapping completato: {len(mapped)} entry mappate su {len(gps_data)}")
